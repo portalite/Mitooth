@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.io.OutputStreamWriter
 import java.io.PrintWriter
 import java.util.UUID
 
@@ -56,6 +57,8 @@ class BluetoothConnection(
 
         serverJob = scope.launch {
             try {
+                serverSocket?.close()
+
                 serverSocket = adapter.listenUsingRfcommWithServiceRecord(
                     SERVICE_NAME,
                     APP_UUID
@@ -116,7 +119,10 @@ class BluetoothConnection(
         readerJob = scope.launch {
             try {
                 val reader = BufferedReader(
-                    InputStreamReader(activeSocket.inputStream, Charsets.UTF_8)
+                    InputStreamReader(
+                        activeSocket.inputStream,
+                        Charsets.UTF_8
+                    )
                 )
 
                 while (isActive) {
@@ -154,9 +160,11 @@ class BluetoothConnection(
 
                 synchronized(writeLock) {
                     val writer = PrintWriter(
-                        activeSocket.outputStream,
-                        true,
-                        Charsets.UTF_8
+                        OutputStreamWriter(
+                            activeSocket.outputStream,
+                            Charsets.UTF_8
+                        ),
+                        true
                     )
 
                     writer.println(message)
