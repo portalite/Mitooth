@@ -9,6 +9,7 @@ import android.bluetooth.BluetoothSocket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -30,39 +31,54 @@ class BluetoothConnection(
         const val SERVICE_NAME = "Mitooth"
     }
 
-    private val scope = CoroutineScope(Dispatchers.IO)
-    private var serverSocket: BluetoothServerSocket? = null
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO
+    )
+
+    @Volatile
     private var socket: BluetoothSocket? = null
+
+    private var serverSocket: BluetoothServerSocket? = null
+    private var serverJob: Job? = null
     private var readerJob: Job? = null
+
+    private val writeLock = Any()
+
+    private suspend fun updateStatus(message: String) {
+        withContext(Dispatchers.Main) {
+            onStatus(message)
+        }
+    }
 
     @SuppressLint("MissingPermission")
     fun startServer() {
-        scope.launch {
+        serverJob?.cancel()
+
+        serverJob = scope.launch {
             try {
                 serverSocket = adapter.listenUsingRfcommWithServiceRecord(
                     SERVICE_NAME,
                     APP_UUID
                 )
 
-                withContext(Dispatchers.Main) {
-                    onStatus("Bağlantı bekleniyor...")
-                }
+                updateStatus("Bağlantı bekleniyor...")
 
-                val acceptedSocket = serverSocket?.accept()
+                val accepted = serverSocket?.accept()
                     ?: throw IllegalStateException("Bağlantı kurulamadı")
 
-                socket = acceptedSocket
+                socket = accepted
                 serverSocket?.close()
                 serverSocket = null
 
-                withContext(Dispatchers.Main) {
-                    onStatus("Bağlandı: ${acceptedSocket.remoteDevice.name ?: "Cihaz"}")
-                }
+                updateStatus(
+                    "Bağlandı: ${accepted.remoteDevice.name ?: "Cihaz"}"
+                )
 
-                listen(acceptedSocket)
+                listen(accepted)
+
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    onStatus("Sunucu hatası: ${e.message}")
+                if (isActive) {
+                    updateStatus("Sunucu hatası: ${e.message}")
                 }
             }
         }
@@ -70,11 +86,11 @@ class BluetoothConnection(
 
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
+        serverJob?.cancel()
+
         scope.launch {
             try {
-                withContext(Dispatchers.Main) {
-                    onStatus("Bağlanılıyor...")
-                }
+                updateStatus("Bağlanılıyor...")
 
                 adapter.cancelDiscovery()
 
@@ -84,38 +100,45 @@ class BluetoothConnection(
                 newSocket.connect()
                 socket = newSocket
 
-                withContext(Dispatchers.Main) {
-                    onStatus("Bağlantı kuruldu")
-                }
+                updateStatus("Bluetooth bağlantısı kuruldu")
 
                 listen(newSocket)
+
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    onStatus("Bağlantı hatası: ${e.message}")
-                }
+                updateStatus("Bağlantı hatası: ${e.message}")
             }
         }
     }
 
-    private suspend fun listen(activeSocket: BluetoothSocket) {
+    private fun listen(activeSocket: BluetoothSocket) {
         readerJob?.cancel()
 
         readerJob = scope.launch {
             try {
                 val reader = BufferedReader(
-                    InputStreamReader(activeSocket.inputStream)
+                    InputStreamReader(activeSocket.inputStream, Charsets.UTF_8)
                 )
 
                 while (isActive) {
-                    val line = reader.readLine() ?: break
+                    val message = reader.readLine() ?: break
 
                     withContext(Dispatchers.Main) {
-                        onMessage(line)
+                        onMessage(message)
                     }
                 }
+
+                updateStatus("Bağlantı kapandı")
+
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    onStatus("Bağlantı kesildi")
+                updateStatus("Bağlantı kesildi")
+            } finally {
+                try {
+                    activeSocket.close()
+                } catch (_: Exception) {
+                }
+
+                if (socket === activeSocket) {
+                    socket = null
                 }
             }
         }
@@ -127,20 +150,31 @@ class BluetoothConnection(
         scope.launch {
             try {
                 val activeSocket = socket
-                    ?: throw IllegalStateException("Bağlı cihaz yok")
+                    ?: throw IllegalStateException("Bağlı cihaz bulunamadı")
 
-                val writer = PrintWriter(activeSocket.outputStream, true)
-                writer.println(message)
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    onStatus("Gönderilemedi: ${e.message}")
+                synchronized(writeLock) {
+                    val writer = PrintWriter(
+                        activeSocket.outputStream,
+                        true,
+                        Charsets.UTF_8
+                    )
+
+                    writer.println(message)
+
+                    if (writer.checkError()) {
+                        throw IllegalStateException("Mesaj gönderilemedi")
+                    }
                 }
+
+            } catch (e: Exception) {
+                updateStatus("Gönderim hatası: ${e.message}")
             }
         }
     }
 
     fun close() {
         readerJob?.cancel()
+        serverJob?.cancel()
 
         try {
             socket?.close()
