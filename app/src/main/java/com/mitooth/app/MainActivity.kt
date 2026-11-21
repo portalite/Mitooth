@@ -6,8 +6,6 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothServerSocket
-import android.bluetooth.BluetoothSocket
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -23,7 +21,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Send
@@ -34,33 +31,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
-import kotlinx.coroutines.*
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.io.PrintWriter
-import java.util.UUID
 
 private val Green = Color(0xFF155B45)
 private val Cream = Color(0xFFF5F3E9)
-private val APP_UUID: UUID =
-    UUID.fromString("8b6d4c20-6a41-4c91-9d2b-7f3a2e5c8101")
 
 class MainActivity : ComponentActivity() {
 
+    private var connection: BluetoothConnection? = null
+    private var receiverRegistered = false
+
+    private val devices = mutableStateListOf<BluetoothDevice>()
+    private val messages = mutableStateListOf<String>()
+    private val status = mutableStateOf("Bağlantı bekleniyor")
+
     private val adapter: BluetoothAdapter? by lazy {
-        val manager = getSystemService(BluetoothManager::class.java)
-        manager.adapter
+        getSystemService(BluetoothManager::class.java).adapter
     }
-
-    private var socket: BluetoothSocket? = null
-    private var serverSocket: BluetoothServerSocket? = null
-    private var connectionJob: Job? = null
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
-    private val _messages = mutableStateListOf<String>()
-    private val _status = mutableStateOf("Bağlantı bekleniyor")
-    private val _devices = mutableStateListOf<BluetoothDevice>()
 
     private val receiver = object : BroadcastReceiver() {
         @SuppressLint("MissingPermission")
@@ -74,154 +60,222 @@ class MainActivity : ComponentActivity() {
                         )
                     } else {
                         @Suppress("DEPRECATION")
-                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                        intent.getParcelableExtra(
+                            BluetoothDevice.EXTRA_DEVICE
+                        )
                     }
 
                 device?.let {
-                    if (_devices.none { d -> d.address == it.address }) {
-                        _devices.add(it)
+                    if (devices.none { item -> item.address == it.address }) {
+                        devices.add(it)
                     }
                 }
             }
         }
     }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
+    private fun requiredPermissions(): Array<String> {
+        val permissions = mutableListOf<String>()
 
-        setContent {
-            MitoothScreen(
-                status = _status.value,
-                devices = _devices.toList(),
-                messages = _messages.toList(),
-                onScan = { startScan() },
-                onConnect = { connect(it) },
-                onSend = { sendMessage(it) }
-            )
+        if (Build.VERSION.SDK_INT >= 31) {
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+            permissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+        } else {
+            permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
         }
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        return permissions.toTypedArray()
     }
 
     private fun hasBluetoothPermissions(): Boolean {
-        if (Build.VERSION.SDK_INT < 31) {
-            return ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
+        val permissions = if (Build.VERSION.SDK_INT >= 31) {
+            listOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.BLUETOOTH_ADVERTISE
+            )
+        } else {
+            listOf(Manifest.permission.ACCESS_FINE_LOCATION)
         }
 
-        return ContextCompat.checkSelfPermission(
-            this,
-            Manifest.permission.BLUETOOTH_SCAN
-        ) == PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.BLUETOOTH_CONNECT
-            ) == PackageManager.PERMISSION_GRANTED
+        return permissions.all {
+            checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun setupConnection() {
+        if (connection != null) return
+
+        val bluetooth = adapter ?: return
+
+        connection = BluetoothConnection(
+            adapter = bluetooth,
+            onStatus = { newStatus ->
+                status.value = newStatus
+            },
+            onMessage = { message ->
+                messages.add("Karşı taraf: $message")
+
+                if (
+                    Build.VERSION.SDK_INT < 33 ||
+                    checkSelfPermission(
+                        Manifest.permission.POST_NOTIFICATIONS
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    NotificationHelper.showMessage(this, message)
+                }
+            }
+        )
+    }
+
+    private fun registerDiscoveryReceiver() {
+        if (receiverRegistered) return
+
+        val filter = IntentFilter(BluetoothDevice.ACTION_FOUND)
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(
+                receiver,
+                filter,
+                Context.RECEIVER_NOT_EXPORTED
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(receiver, filter)
+        }
+
+        receiverRegistered = true
     }
 
     @SuppressLint("MissingPermission")
-    private fun startScan() {
+    private fun startScanning() {
         if (!hasBluetoothPermissions()) {
-            _status.value = "Bluetooth izinleri gerekli"
+            status.value = "Bluetooth izinleri gerekli"
             return
         }
 
         val bluetooth = adapter ?: run {
-            _status.value = "Bu cihaz Bluetooth desteklemiyor"
+            status.value = "Bluetooth desteklenmiyor"
             return
         }
 
         if (!bluetooth.isEnabled) {
-            _status.value = "Önce Bluetooth'u aç"
+            status.value = "Önce Bluetooth'u aç"
+            startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
             return
         }
 
-        _devices.clear()
-
         try {
-            registerReceiver(
-                receiver,
-                IntentFilter(BluetoothDevice.ACTION_FOUND)
-            )
+            registerDiscoveryReceiver()
+            devices.clear()
             bluetooth.cancelDiscovery()
             bluetooth.startDiscovery()
-            _status.value = "Cihazlar aranıyor..."
+            status.value = "Yakındaki cihazlar aranıyor..."
         } catch (e: Exception) {
-            _status.value = "Arama başlatılamadı: ${e.message}"
+            status.value = "Arama hatası: ${e.message}"
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun connect(device: BluetoothDevice) {
-        if (!hasBluetoothPermissions()) return
+    private fun startWaiting() {
+        if (!hasBluetoothPermissions()) {
+            status.value = "Bluetooth izinleri gerekli"
+            return
+        }
 
-        connectionJob?.cancel()
-        connectionJob = scope.launch {
-            try {
-                withContext(Dispatchers.Main) {
-                    _status.value = "Bağlanılıyor..."
-                }
+        val bluetooth = adapter ?: return
 
-                adapter?.cancelDiscovery()
+        if (!bluetooth.isEnabled) {
+            status.value = "Önce Bluetooth'u aç"
+            startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+            return
+        }
 
-                val newSocket =
-                    device.createRfcommSocketToServiceRecord(APP_UUID)
+        setupConnection()
 
-                newSocket.connect()
-                socket = newSocket
+        try {
+            connection?.startServer()
 
-                withContext(Dispatchers.Main) {
-                    _status.value = "Bağlandı: ${device.name ?: "Cihaz"}"
-                }
-
-                listenForMessages(newSocket)
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    _status.value = "Bağlantı başarısız: ${e.message}"
-                }
+            val discoverableIntent = Intent(
+                BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE
+            ).apply {
+                putExtra(
+                    BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION,
+                    300
+                )
             }
+
+            startActivity(discoverableIntent)
+            status.value = "Bağlantı bekleniyor..."
+        } catch (e: Exception) {
+            status.value = "Bekleme hatası: ${e.message}"
         }
     }
 
-    private suspend fun listenForMessages(activeSocket: BluetoothSocket) {
-        try {
-            val reader = BufferedReader(
-                InputStreamReader(activeSocket.inputStream)
-            )
+    @SuppressLint("MissingPermission")
+    private fun connectTo(device: BluetoothDevice) {
+        if (!hasBluetoothPermissions()) return
 
-            while (currentCoroutineContext().isActive) {
-                val message = reader.readLine() ?: break
-
-                withContext(Dispatchers.Main) {
-                    _messages.add("Karşı taraf: $message")
-                }
-            }
-        } catch (_: Exception) {
-            withContext(Dispatchers.Main) {
-                _status.value = "Bağlantı kesildi"
-            }
-        }
+        setupConnection()
+        adapter?.cancelDiscovery()
+        connection?.connect(device)
     }
 
     private fun sendMessage(message: String) {
         if (message.isBlank()) return
 
-        scope.launch {
-            try {
-                val activeSocket = socket
-                    ?: throw IllegalStateException("Önce bağlanmalısın")
+        if (connection == null) {
+            status.value = "Önce bir cihaza bağlan"
+            return
+        }
 
-                val writer = PrintWriter(activeSocket.outputStream, true)
-                writer.println(message)
+        connection?.send(message)
+        messages.add("Ben: $message")
+    }
 
-                withContext(Dispatchers.Main) {
-                    _messages.add("Ben: $message")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        NotificationHelper.createChannel(this)
+
+        setContent {
+            val permissionLauncher =
+                rememberLauncherForActivityResult(
+                    ActivityResultContracts.RequestMultiplePermissions()
+                ) {
+                    if (hasBluetoothPermissions()) {
+                        status.value = "İzinler hazır. İşlem düğmesine tekrar bas."
+                    } else {
+                        status.value = "Gerekli Bluetooth izinleri verilmedi"
+                    }
                 }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    _status.value = "Mesaj gönderilemedi: ${e.message}"
-                }
-            }
+
+            MitoothScreen(
+                status = status.value,
+                devices = devices.toList(),
+                messages = messages.toList(),
+                onScan = {
+                    if (hasBluetoothPermissions()) {
+                        startScanning()
+                    } else {
+                        permissionLauncher.launch(requiredPermissions())
+                    }
+                },
+                onWait = {
+                    if (hasBluetoothPermissions()) {
+                        startWaiting()
+                    } else {
+                        permissionLauncher.launch(requiredPermissions())
+                    }
+                },
+                onConnect = { connectTo(it) },
+                onSend = { sendMessage(it) }
+            )
         }
     }
 
@@ -229,16 +283,15 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
 
         try {
-            unregisterReceiver(receiver)
+            if (receiverRegistered) {
+                unregisterReceiver(receiver)
+                receiverRegistered = false
+            }
         } catch (_: Exception) {
         }
 
-        scope.cancel()
-        try {
-            socket?.close()
-            serverSocket?.close()
-        } catch (_: Exception) {
-        }
+        connection?.close()
+        connection = null
     }
 }
 
@@ -249,6 +302,7 @@ fun MitoothScreen(
     devices: List<BluetoothDevice>,
     messages: List<String>,
     onScan: () -> Unit,
+    onWait: () -> Unit,
     onConnect: (BluetoothDevice) -> Unit,
     onSend: (String) -> Unit
 ) {
@@ -262,8 +316,7 @@ fun MitoothScreen(
                     Text("Mitooth", color = Color.White)
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = Green,
-                    titleContentColor = Color.White
+                    containerColor = Green
                 )
             )
         }
@@ -274,30 +327,41 @@ fun MitoothScreen(
                 .padding(padding)
                 .padding(16.dp)
         ) {
-            Text("Bluetooth: $status", fontSize = 14.sp)
+            Text(
+                "● $status",
+                color = Green,
+                fontSize = 14.sp
+            )
 
             Spacer(Modifier.height(12.dp))
 
             Button(
-                onClick = onScan,
+                onClick = onWait,
+                modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Green
-                ),
+                )
+            ) {
+                Text("Bağlantı bekle")
+            }
+
+            OutlinedButton(
+                onClick = onScan,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Icon(Icons.Default.Bluetooth, null)
                 Spacer(Modifier.width(8.dp))
-                Text("Yakındaki cihazları bul")
+                Text("Cihazları bul")
             }
 
             Text(
-                "Bulunan cihazlar",
-                fontSize = 18.sp,
-                color = Green
+                "Yakındaki cihazlar",
+                color = Green,
+                fontSize = 18.sp
             )
 
             LazyColumn(
-                modifier = Modifier.heightIn(max = 150.dp)
+                modifier = Modifier.heightIn(max = 160.dp)
             ) {
                 items(devices) { device ->
                     DeviceRow(device, onConnect)
@@ -307,9 +371,9 @@ fun MitoothScreen(
             HorizontalDivider()
 
             Text(
-                "Mesajlar",
-                fontSize = 20.sp,
+                "Sohbet",
                 color = Green,
+                fontSize = 20.sp,
                 modifier = Modifier.padding(vertical = 10.dp)
             )
 
@@ -322,8 +386,7 @@ fun MitoothScreen(
                     Card(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(vertical = 4.dp),
-                        shape = RoundedCornerShape(12.dp)
+                            .padding(vertical = 4.dp)
                     ) {
                         Text(
                             message,
@@ -340,7 +403,9 @@ fun MitoothScreen(
                     value = text,
                     onValueChange = { text = it },
                     modifier = Modifier.weight(1f),
-                    placeholder = { Text("Mesajını yaz...") },
+                    placeholder = {
+                        Text("Mesajını yaz...")
+                    },
                     singleLine = true
                 )
 
@@ -377,11 +442,14 @@ fun DeviceRow(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(Icons.Default.Bluetooth, null, tint = Green)
+
         Spacer(Modifier.width(10.dp))
+
         Column {
             Text(device.name ?: "İsimsiz cihaz")
             Text(device.address, fontSize = 11.sp)
         }
+
         Spacer(Modifier.weight(1f))
         Text("Bağlan", color = Green)
     }
